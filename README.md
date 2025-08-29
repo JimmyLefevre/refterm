@@ -1,6 +1,8 @@
 # refterm v2
 
-refterm is a reference renderer for monospace terminal displays.  It was designed to demonstrate that even in the worst-case scenario - extremely slow Unicode parsing with Uniscribe and extremely slow glyph generation with DirectWrite - it is still straightforward to achieve reasonable frame rates and reasonable throughput by being sensible.
+refterm is a reference renderer for monospace terminal displays.  It was designed to demonstrate that even in challenging scenarios - complex Unicode text processing and glyph generation with DirectWrite - it is still straightforward to achieve reasonable frame rates and reasonable throughput by being sensible.
+
+refterm now uses the kb_text_shape library for Unicode text shaping and line breaking, providing cross-platform compatibility while maintaining full support for complex scripts, RTL languages, and advanced Unicode features.
 
 __Please note that refterm is UTF-8__.  If you are doing tests with it, you must use UTF-8 encoded files or command output.
 
@@ -28,10 +30,11 @@ These features are not designed to be comprehensive, since this is only meant to
 
 # Code Layout
 
-The important code for the reference renderer resides in three simple files:
+The important code for the reference renderer resides in these key files:
 
 * refterm.hlsl - shader for doing tile-based rendering
 * refterm_glyph_cache.h/c - cache for mapping Unicode runs to glyphs
+* kb_text_shape.h - Unicode text shaping and line breaking library (replaces Uniscribe)
 
 The rest of the code - refterm_example_*.h/c - is just there to verify that the API for the glyph cache conveniently supports all the features a terminal needs.  The code in those files may be useful as a vague reference, but no thought was put into their design so it is not likely to be directly useful.
 

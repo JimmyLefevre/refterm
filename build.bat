@@ -6,10 +6,6 @@ where /q cl || (
   exit /b 1
 )
 
-if "%Platform%" neq "x64" (
-    echo ERROR: Platform is not "x64" - please run this from the MSVC x64 native tools command prompt.
-    exit /b 1
-)
 
 call fxc /nologo /T cs_5_0 /E ComputeMain /O3 /WX /Fh refterm_cs.h /Vn ReftermCSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl
 call fxc /nologo /T ps_5_0 /E PixelMain /O3 /WX /Fh refterm_ps.h /Vn ReftermPSShaderBytes /Qstrip_reflect /Qstrip_debug /Qstrip_priv refterm.hlsl

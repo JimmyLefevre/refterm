@@ -349,7 +349,6 @@ static void RendererDraw(example_terminal *Terminal, uint32_t Width, uint32_t He
 
     HRESULT hr;
 
-    // resize RenderView to match window size
     if(Width != Renderer->CurrentWidth || Height != Renderer->CurrentHeight)
     {
         ID3D11DeviceContext_ClearState(Renderer->DeviceContext);

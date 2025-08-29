@@ -253,7 +253,6 @@ static int ParseEscape(example_terminal *Terminal, source_buffer_range *Range, c
     {
         case 'H':
         {
-            // NOTE(casey): Move cursor to X,Y position
             Cursor->At.X = Params[1] - 1;
             Cursor->At.Y = Params[0] - 1;
             MovedCursor = 1;
@@ -261,7 +260,6 @@ static int ParseEscape(example_terminal *Terminal, source_buffer_range *Range, c
 
         case 'm':
         {
-            // NOTE(casey): Set graphics mode
             if(Params[0] == 0)
             {
                 ClearProps(Terminal, &Cursor->Props);
@@ -371,148 +369,467 @@ static void ParseLines(example_terminal *Terminal, source_buffer_range Range, cu
     }
 }
 
-static void ParseWithUniscribe(example_terminal *Terminal, source_buffer_range UTF8Range, cursor_state *Cursor)
+
+static void AppendOutput(example_terminal *Terminal, char *Format, ...);
+
+static HANDLE g_hDebugLog = INVALID_HANDLE_VALUE;
+static void WriteDebugLog(const char *format, ...)
 {
-    /* TODO(casey): This code is absolutely horrible - Uniscribe is basically unusable as an API, because it doesn't support
-       a clean state-machine way of feeding things to it.  So I don't even know how you would really use it in a way
-       that guaranteed you didn't have buffer-too-small problems.  It's just horrible.
-
-       Plus, it is UTF16, which means we have to do an entire conversion here before we even call it :(
-
-       I would rather get rid of this function altogether and move to something that supports UTF8, because we never
-       actually want to have to do this garbage - it's just a giant hack for no reason.  Basically everything in this
-       function should be replaced by something that can turn UTF8 into chunks that need to be rasterized together.
-
-       That's all we need here, and it could be done very efficiently with sensible code.
-    */
-
-    example_partitioner *Partitioner = &Terminal->Partitioner;
-
-    DWORD Count = MultiByteToWideChar(CP_UTF8, 0, UTF8Range.Data, (DWORD)UTF8Range.Count,
-                                      Partitioner->Expansion, ArrayCount(Partitioner->Expansion));
-    wchar_t *Data = Partitioner->Expansion;
-
-    int ItemCount = 0;
-    ScriptItemize(Data, Count, ArrayCount(Partitioner->Items), &Partitioner->UniControl, &Partitioner->UniState, Partitioner->Items, &ItemCount);
-
-    int Segment = 0;
-
-    for(int ItemIndex = 0;
-        ItemIndex < ItemCount;
-        ++ItemIndex)
+    if (g_hDebugLog != INVALID_HANDLE_VALUE)
     {
-        SCRIPT_ITEM *Item = Partitioner->Items + ItemIndex;
+        char buffer[1024];
+        va_list args;
+        va_start(args, format);
+        int len = wvsprintfA(buffer, format, args);
+        va_end(args);
+        
+        DWORD written;
+        WriteFile(g_hDebugLog, buffer, len, &written, NULL);
+        FlushFileBuffers(g_hDebugLog);
+    }
+}
 
-        Assert((DWORD)Item->iCharPos < Count);
-        DWORD StrCount = Count - Item->iCharPos;
-        if((ItemIndex + 1) < ItemCount)
+static void ParseWithKB(example_terminal *Terminal, source_buffer_range UTF8Range, cursor_state *Cursor)
+{
+    kb_partitioner *KBPartitioner = &Terminal->KBPartitioner;
+    
+    if (Terminal->DebugHighlighting && g_hDebugLog == INVALID_HANDLE_VALUE)
+    {
+        g_hDebugLog = CreateFileA("kb_debug.log", GENERIC_WRITE, FILE_SHARE_READ, NULL, 
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (g_hDebugLog != INVALID_HANDLE_VALUE)
         {
-            Assert(Item[1].iCharPos >= Item[0].iCharPos);
-            StrCount = (Item[1].iCharPos - Item[0].iCharPos);
+            WriteDebugLog("=== KB Debug Log Started ===\r\n");
+            WriteDebugLog("ParseWithKB called with %zu bytes of UTF-8 input\r\n", UTF8Range.Count);
         }
-
-        wchar_t *Str = Data + Item->iCharPos;
-
-        int IsComplex = (ScriptIsComplex(Str, StrCount, SIC_COMPLEX) == S_OK);
-        ScriptBreak(Str, StrCount, &Item->a, Partitioner->Log);
-
-        int SegCount = 0;
-
-        Partitioner->SegP[SegCount++] = 0;
-        for(uint32_t CheckIndex = 0;
-            CheckIndex < StrCount;
-            ++CheckIndex)
+    }
+    
+    kbts_BeginBreak(&KBPartitioner->BreakState, KBTS_DIRECTION_NONE, KBTS_JAPANESE_LINE_BREAK_STYLE_NORMAL);
+    
+    if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[KB_INIT] Initialized KB break state with direction=NONE, style=NORMAL\n");
+        AppendOutput(Terminal, "[KB_INIT] Processing UTF-8 range: %zu bytes\n", UTF8Range.Count);
+    }
+    
+    size_t StringAt = 0;
+    uint32_t CurrentPosition = 0;
+    
+    uint32_t SpacePositions[1024];
+    uint32_t SpaceCount = 0;
+    
+    if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[UTF8] Starting UTF-8 decoding loop for %zu bytes\n", UTF8Range.Count);
+    }
+    
+    while (StringAt < UTF8Range.Count)
+    {
+        kbts_decode Decode = kbts_DecodeUtf8(UTF8Range.Data + StringAt, UTF8Range.Count - StringAt);
+        StringAt += Decode.SourceCharactersConsumed;
+        
+        if (Decode.Valid)
         {
-            SCRIPT_LOGATTR Attr = Partitioner->Log[CheckIndex];
-            int ShouldBreak = (Str[CheckIndex] == ' ');;
-            if(IsComplex)
+            if (Terminal->DebugHighlighting && CurrentPosition < 10)
             {
-                ShouldBreak |= Attr.fSoftBreak;
+                AppendOutput(Terminal, "[UTF8] Decoded codepoint U+%04X at position %u, consumed %u bytes\n", 
+                           Decode.Codepoint, CurrentPosition, Decode.SourceCharactersConsumed);
+                WriteDebugLog("[UTF8] Decoded codepoint U+%04X at position %u, consumed %u bytes\r\n",
+                             Decode.Codepoint, CurrentPosition, Decode.SourceCharactersConsumed);
+            }
+            
+            if (Decode.Codepoint == ' ' && SpaceCount < ArrayCount(SpacePositions))
+            {
+                SpacePositions[SpaceCount++] = CurrentPosition;
+                if (Terminal->DebugHighlighting)
+                {
+                    AppendOutput(Terminal, "[UTF8] Found space at position %u (space #%u)\n", CurrentPosition, SpaceCount);
+                }
+            }
+            
+            int EndOfText = (StringAt >= UTF8Range.Count);
+            kbts_BreakAddCodepoint(&KBPartitioner->BreakState, Decode.Codepoint, 1, EndOfText);
+            CurrentPosition++;
+        }
+        else if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[UTF8] Invalid UTF-8 sequence at byte offset %zu\n", StringAt - Decode.SourceCharactersConsumed);
+        }
+    }
+    
+    if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[UTF8] Completed decoding: %u codepoints, %u spaces found\n", CurrentPosition, SpaceCount);
+    }
+    
+    KBPartitioner->SegmentCount = 0;
+    
+    if (KBPartitioner->SegmentCount < ArrayCount(KBPartitioner->SegP))
+    {
+        KBPartitioner->SegP[KBPartitioner->SegmentCount++] = 0;
+        if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[BOUNDS] Added segment start at position 0, SegmentCount now %u/%u\n", 
+                       KBPartitioner->SegmentCount, ArrayCount(KBPartitioner->SegP));
+        }
+    }
+    else if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[BOUNDS] ERROR: Cannot add segment start - SegP array full (%u/%u)\n", 
+                   KBPartitioner->SegmentCount, ArrayCount(KBPartitioner->SegP));
+    }
+    
+    uint32_t LastBreakPosition = 0;
+    kbts_break Break;
+    
+    int HasRTL = 0;
+    kbts_direction CurrentDirection = KBTS_DIRECTION_LTR;
+    
+    kbts_script CurrentScript = KBTS_SCRIPT_DONT_KNOW;
+    
+    if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[BREAK] Starting break processing loop\n");
+    }
+    
+    uint32_t BreakCount = 0;
+    while (kbts_Break(&KBPartitioner->BreakState, &Break))
+    {
+        BreakCount++;
+        if (Terminal->DebugHighlighting && BreakCount <= 20)
+        {
+            AppendOutput(Terminal, "[BREAK] Break #%u at position %u, flags=0x%08X\n", 
+                       BreakCount, Break.Position, Break.Flags);
+        }
+        
+        if (Break.Flags & KBTS_BREAK_FLAG_DIRECTION)
+        {
+            CurrentDirection = Break.Direction;
+            if (Break.Direction == KBTS_DIRECTION_RTL)
+            {
+                HasRTL = 1;
+                if (Terminal->DebugHighlighting)
+                {
+                    AppendOutput(Terminal, "[BREAK] RTL direction detected at position %u\n", Break.Position);
+                }
+            }
+            else if (Terminal->DebugHighlighting)
+            {
+                AppendOutput(Terminal, "[BREAK] Direction changed to %s at position %u\n", 
+                           (Break.Direction == KBTS_DIRECTION_LTR) ? "LTR" : "UNKNOWN", Break.Position);
+            }
+        }
+        
+        if (Break.Flags & KBTS_BREAK_FLAG_SCRIPT)
+        {
+            CurrentScript = Break.Script;
+            if (Terminal->DebugHighlighting)
+            {
+                AppendOutput(Terminal, "[BREAK] Script changed to %u at position %u\n", 
+                           CurrentScript, Break.Position);
+            }
+        }
+        
+        int ShouldBreak = 0;
+        
+        if (Break.Flags & KBTS_BREAK_FLAG_LINE_HARD)
+        {
+            ShouldBreak = 1;
+        }
+        else if ((CurrentScript != KBTS_SCRIPT_DONT_KNOW && kbts_ScriptIsComplex(CurrentScript)) || HasRTL)
+        {
+            if (Break.Flags & KBTS_BREAK_FLAG_LINE_SOFT)
+            {
+                ShouldBreak = 1;
+            }
+        }
+        else
+        {
+            if (Break.Flags & KBTS_BREAK_FLAG_GRAPHEME)
+            {
+                ShouldBreak = 1;
+            }
+        }
+        
+        if (Break.Flags & (KBTS_BREAK_FLAG_SCRIPT | KBTS_BREAK_FLAG_DIRECTION | KBTS_BREAK_FLAG_WORD))
+        {
+            ShouldBreak = 1;
+        }
+        
+        if (ShouldBreak && Break.Position > LastBreakPosition)
+        {
+            if (KBPartitioner->SegmentCount < ArrayCount(KBPartitioner->SegP))
+            {
+                KBPartitioner->SegP[KBPartitioner->SegmentCount++] = Break.Position;
+                LastBreakPosition = Break.Position;
+                if (Terminal->DebugHighlighting)
+                {
+                    AppendOutput(Terminal, "[BOUNDS] Added break at position %u, SegmentCount now %u/%u\n", 
+                               Break.Position, KBPartitioner->SegmentCount, ArrayCount(KBPartitioner->SegP));
+                }
+            }
+            else if (Terminal->DebugHighlighting)
+            {
+                AppendOutput(Terminal, "[BOUNDS] ERROR: Cannot add break - SegP array full at position %u\n", Break.Position);
+            }
+        }
+    }
+    
+    if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[BREAK] Completed break processing: %u breaks processed, HasRTL=%d, CurrentScript=%u\n", 
+                   BreakCount, HasRTL, CurrentScript);
+    }
+    
+    if (!kbts_BreakStateIsValid(&KBPartitioner->BreakState))
+    {
+        if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[ERROR] Break state is invalid after processing - restarting\n");
+        }
+        kbts_BeginBreak(&KBPartitioner->BreakState, KBTS_DIRECTION_NONE, KBTS_JAPANESE_LINE_BREAK_STYLE_NORMAL);
+        return;
+    }
+    else if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[BREAK] Break state is valid\n");
+    }
+    
+    // Add space character positions as additional break points (matches original ScriptBreak behavior)
+    for (uint32_t SpaceIndex = 0; SpaceIndex < SpaceCount; ++SpaceIndex)
+    {
+        uint32_t SpacePos = SpacePositions[SpaceIndex];
+        if (SpacePos > LastBreakPosition)
+        {
+            int AlreadyExists = 0;
+            for (uint32_t CheckIndex = 0; CheckIndex < KBPartitioner->SegmentCount; ++CheckIndex)
+            {
+                if (KBPartitioner->SegP[CheckIndex] == SpacePos)
+                {
+                    AlreadyExists = 1;
+                    break;
+                }
+            }
+            
+            if (!AlreadyExists && KBPartitioner->SegmentCount < ArrayCount(KBPartitioner->SegP))
+            {
+                KBPartitioner->SegP[KBPartitioner->SegmentCount++] = SpacePos;
+                if (Terminal->DebugHighlighting)
+                {
+                    AppendOutput(Terminal, "[BOUNDS] Added space break at position %u, SegmentCount now %u\n", 
+                               SpacePos, KBPartitioner->SegmentCount);
+                }
+            }
+            else if (Terminal->DebugHighlighting && KBPartitioner->SegmentCount >= ArrayCount(KBPartitioner->SegP))
+            {
+                AppendOutput(Terminal, "[BOUNDS] ERROR: Cannot add space break - SegP array full\n");
+            }
+        }
+    }
+    
+    for (uint32_t i = 1; i < KBPartitioner->SegmentCount; ++i)
+    {
+        uint32_t key = KBPartitioner->SegP[i];
+        int j = i - 1;
+        while (j >= 0 && KBPartitioner->SegP[j] > key)
+        {
+            KBPartitioner->SegP[j + 1] = KBPartitioner->SegP[j];
+            j--;
+        }
+        KBPartitioner->SegP[j + 1] = key;
+    }
+    
+    if (KBPartitioner->SegmentCount == 0 || 
+        (KBPartitioner->SegmentCount > 0 && KBPartitioner->SegP[KBPartitioner->SegmentCount - 1] != CurrentPosition))
+    {
+        if (KBPartitioner->SegmentCount < ArrayCount(KBPartitioner->SegP))
+        {
+            KBPartitioner->SegP[KBPartitioner->SegmentCount++] = CurrentPosition;
+            if (Terminal->DebugHighlighting)
+            {
+                AppendOutput(Terminal, "[BOUNDS] Added final position %u, SegmentCount now %u\n", 
+                           CurrentPosition, KBPartitioner->SegmentCount);
+            }
+        }
+        else if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[BOUNDS] ERROR: Cannot add final position - SegP array full\n");
+        }
+    }
+    
+    int Segment = 0;
+    
+    // RTL Support: When RTL is detected, reverse the segment processing order
+    // This follows the original buffer run logic
+    // RTL text needs to be processed from right-to-left, so we reverse the segment iteration
+    int dSeg = 1;
+    uint32_t SegStart = 0;
+    uint32_t SegStop = KBPartitioner->SegmentCount > 0 ? KBPartitioner->SegmentCount - 1 : 0;
+    
+    if (HasRTL && CurrentDirection == KBTS_DIRECTION_RTL && KBPartitioner->SegmentCount >= 2)
+    {
+        dSeg = -1;
+        SegStart = KBPartitioner->SegmentCount - 2;
+        SegStop = UINT32_MAX;
+        
+        if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[RTL] RTL processing enabled: start=%u, stop=%u, step=%d\n", 
+                       SegStart, SegStop, dSeg);
+        }
+    }
+    else if (Terminal->DebugHighlighting)
+    {
+        AppendOutput(Terminal, "[RTL] LTR processing: start=%u, stop=%u, step=%d, HasRTL=%d, SegmentCount=%u\n", 
+                   SegStart, SegStop, dSeg, HasRTL, KBPartitioner->SegmentCount);
+    }
+    
+    for (uint32_t SegIndex = SegStart; SegIndex != SegStop; SegIndex += dSeg)
+    {
+        if (SegIndex >= 1026 || (SegIndex + 1) >= 1026)
+        {
+            if (Terminal->DebugHighlighting)
+            {
+                AppendOutput(Terminal, "[SEG] ERROR: Segment bounds exceeded at index %u - stopping\n", SegIndex);
+            }
+            break;
+        }
+        
+        if (Terminal->DebugHighlighting)
+        {
+            AppendOutput(Terminal, "[SEG] Processing segment %u: range [%u, %u)\n", 
+                       SegIndex, KBPartitioner->SegP[SegIndex], KBPartitioner->SegP[SegIndex + 1]);
+        }
+        
+        uint32_t Start = KBPartitioner->SegP[SegIndex];
+        uint32_t End = KBPartitioner->SegP[SegIndex + 1];
+        uint32_t SegmentLength = End - Start;
+        
+        if (SegmentLength > 0)
+        {
+            // Complex Script Detection: Use kbts_ScriptIsComplex() to detect complex scripts
+            // and apply different break strategies for complex vs simple scripts
+            int IsComplex = 0;
+            
+            // Use proper script complexity detection instead of heuristic
+            if (CurrentScript != KBTS_SCRIPT_DONT_KNOW)
+            {
+                IsComplex = kbts_ScriptIsComplex(CurrentScript);
             }
             else
             {
-                ShouldBreak |= Attr.fCharStop;
+                // Fallback for unknown scripts - check if RTL or multi-codepoint
+                IsComplex = (HasRTL || SegmentLength > 1);
             }
-
-            if(ShouldBreak) Partitioner->SegP[SegCount++] = CheckIndex;
-        }
-        Partitioner->SegP[SegCount++] = StrCount;
-
-        int dSeg = 1;
-        int SegStart = 0;
-        int SegStop = SegCount - 1;
-        if(Item->a.fRTL || Item->a.fLayoutRTL)
-        {
-            dSeg = -1;
-            SegStart = SegCount - 2;
-            SegStop = -1;
-        }
-
-        for(int SegIndex = SegStart;
-            SegIndex != SegStop;
-            SegIndex += dSeg)
-        {
-            size_t Start = Partitioner->SegP[SegIndex];
-            size_t End = Partitioner->SegP[SegIndex + 1];
-            size_t ThisCount = (End - Start);
-            if(ThisCount)
+            
+            size_t UTF8Start = 0;
+            size_t UTF8End = 0;
+            uint32_t CodepointCount = 0;
+            size_t ByteOffset = 0;
+            while (ByteOffset < UTF8Range.Count && CodepointCount <= End)
             {
-                wchar_t *Run = Str + Start;
-                wchar_t CodePoint = Run[0];
-                if((ThisCount == 1) && IsDirectCodepoint(CodePoint))
+                if (CodepointCount == Start)
+                    UTF8Start = ByteOffset;
+                if (CodepointCount == End)
+                {
+                    UTF8End = ByteOffset;
+                    break;
+                }
+                
+                kbts_decode Decode = kbts_DecodeUtf8(UTF8Range.Data + ByteOffset, UTF8Range.Count - ByteOffset);
+                ByteOffset += Decode.SourceCharactersConsumed;
+                if (Decode.Valid)
+                    CodepointCount++;
+            }
+            
+            if (CodepointCount == End)
+                UTF8End = ByteOffset;
+            
+            size_t UTF8SegmentLength = UTF8End - UTF8Start;
+            
+            if (UTF8SegmentLength > 0)
+            {
+                char *UTF8Segment = UTF8Range.Data + UTF8Start;
+                
+                int IsAllDirect = 1;
+                size_t CheckOffset = 0;
+                uint32_t DirectCodepoint = 0;
+                
+                if (UTF8SegmentLength == 1 && UTF8Segment[0] >= MinDirectCodepoint && UTF8Segment[0] <= MaxDirectCodepoint)
+                {
+                    DirectCodepoint = UTF8Segment[0];
+                }
+                else
+                {
+                    IsAllDirect = 0;
+                }
+                
+                if (IsAllDirect && UTF8SegmentLength == 1)
                 {
                     renderer_cell *Cell = GetCell(&Terminal->ScreenBuffer, Cursor->At);
-                    if(Cell)
+                    if (Cell)
                     {
                         glyph_props Props = Cursor->Props;
-                        if(Terminal->DebugHighlighting)
+                        if (Terminal->DebugHighlighting)
                         {
                             Props.Background = 0x00800000;
                         }
-                        SetCellDirect(Terminal->ReservedTileTable[CodePoint - MinDirectCodepoint], Props, Cell);
+                        SetCellDirect(Terminal->ReservedTileTable[DirectCodepoint - MinDirectCodepoint], Props, Cell);
                     }
-
                     AdvanceColumn(Terminal, &Cursor->At);
                 }
                 else
                 {
-                    // TODO(casey): This wastes a lookup on the tile count.
-                    // It should save the entry somehow, and roll it into the first cell.
-
-                    int Prepped = 0;
-                    glyph_hash RunHash = ComputeGlyphHash(2*ThisCount, (char unsigned *)Run, DefaultSeed);
-                    glyph_dim GlyphDim = GetGlyphDim(&Terminal->GlyphGen, Terminal->GlyphTable, ThisCount, Run, RunHash);
-                    for(uint32_t TileIndex = 0;
-                        TileIndex < GlyphDim.TileCount;
-                        ++TileIndex)
+                    wchar_t UTF16Buffer[1024];
+                    DWORD UTF16Count = MultiByteToWideChar(CP_UTF8, 0, UTF8Segment, (DWORD)UTF8SegmentLength, UTF16Buffer, ArrayCount(UTF16Buffer));
+                    
+                    if (Terminal->DebugHighlighting)
                     {
-                        renderer_cell *Cell = GetCell(&Terminal->ScreenBuffer, Cursor->At);
-                        if(Cell)
+                        AppendOutput(Terminal, "[CONV] UTF-8 to UTF-16: %zu bytes -> %u UTF-16 units (segment %u)\n", 
+                                   UTF8SegmentLength, UTF16Count, SegIndex);
+                        if (UTF16Count == 0)
                         {
-                            glyph_hash TileHash = ComputeHashForTileIndex(RunHash, TileIndex);
-                            glyph_state Entry = FindGlyphEntryByHash(Terminal->GlyphTable, TileHash);
-                            if(Entry.FilledState != GlyphState_Rasterized)
-                            {
-                                if(!Prepped)
-                                {
-                                    PrepareTilesForTransfer(&Terminal->GlyphGen, &Terminal->Renderer, ThisCount, Run, GlyphDim);
-                                    Prepped = 1;
-                                }
-
-                                TransferTile(&Terminal->GlyphGen, &Terminal->Renderer, TileIndex, Entry.GPUIndex);
-                                UpdateGlyphCacheEntry(Terminal->GlyphTable, Entry.ID, GlyphState_Rasterized, Entry.DimX, Entry.DimY);
-                            }
-
-                            glyph_props Props = Cursor->Props;
-                            if(Terminal->DebugHighlighting)
-                            {
-                                Props.Background = Segment ? 0x0008080 : 0x00000080;
-                                Segment = !Segment;
-                            }
-                            SetCellDirect(Entry.GPUIndex, Props, Cell);
+                            DWORD Error = GetLastError();
+                            AppendOutput(Terminal, "[CONV] ERROR: Conversion failed with error %u\n", Error);
                         }
-
-                        AdvanceColumn(Terminal, &Cursor->At);
+                    }
+                    
+                    if (UTF16Count > 0)
+                    {
+                        int Prepped = 0;
+                        glyph_hash RunHash = ComputeGlyphHash(2 * UTF16Count, (char unsigned *)UTF16Buffer, DefaultSeed);
+                        glyph_dim GlyphDim = GetGlyphDim(&Terminal->GlyphGen, Terminal->GlyphTable, UTF16Count, UTF16Buffer, RunHash);
+                        
+                        for (uint32_t TileIndex = 0; TileIndex < GlyphDim.TileCount; ++TileIndex)
+                        {
+                            renderer_cell *Cell = GetCell(&Terminal->ScreenBuffer, Cursor->At);
+                            if (Cell)
+                            {
+                                glyph_hash TileHash = ComputeHashForTileIndex(RunHash, TileIndex);
+                                glyph_state Entry = FindGlyphEntryByHash(Terminal->GlyphTable, TileHash);
+                                if (Entry.FilledState != GlyphState_Rasterized)
+                                {
+                                    if (!Prepped)
+                                    {
+                                        PrepareTilesForTransfer(&Terminal->GlyphGen, &Terminal->Renderer, UTF16Count, UTF16Buffer, GlyphDim);
+                                        Prepped = 1;
+                                    }
+                                    
+                                    TransferTile(&Terminal->GlyphGen, &Terminal->Renderer, TileIndex, Entry.GPUIndex);
+                                    UpdateGlyphCacheEntry(Terminal->GlyphTable, Entry.ID, GlyphState_Rasterized, Entry.DimX, Entry.DimY);
+                                }
+                                
+                                glyph_props Props = Cursor->Props;
+                                if (Terminal->DebugHighlighting)
+                                {
+                                    Props.Background = Segment ? 0x0008080 : 0x00000080;
+                                    Segment = !Segment;
+                                }
+                                SetCellDirect(Entry.GPUIndex, Props, Cell);
+                            }
+                            
+                            AdvanceColumn(Terminal, &Cursor->At);
+                        }
                     }
                 }
             }
@@ -527,7 +844,6 @@ static int ParseLineIntoGlyphs(example_terminal *Terminal, source_buffer_range R
 
     while(Range.Count)
     {
-        // NOTE(casey): Eat all non-Unicode
         char Peek = PeekToken(&Range, 0);
         if((Peek == '\x1b') && AtEscape(&Range))
         {
@@ -552,20 +868,14 @@ static int ParseLineIntoGlyphs(example_terminal *Terminal, source_buffer_range R
                recombine properly with Unicode.  I _DO NOT_ think this should be fixed in
                the line parser.  Instead, the fix should be what should happen here to begin
                with, which is that the glyph chunking should happen in a state machine,
-               NOT using buffer runs like Uniscribe does.
+               NOT using buffer runs like the original implementation.
 
                So I believe the _correct_ design here is that you have a state machine instead
-               of Uniscribe for complex grapheme clusters, and _that_ will "just work" here
+               of the original segmentation for complex grapheme clusters, and _that_ will "just work" here
                as well as being much much faster than the current path, which is very slow
-               because of Uniscribe _and_ is limited to intermediate buffer sizes.
+               because of the original segmentation _and_ is limited to intermediate buffer sizes.
             */
 
-            // NOTE(casey): If it's not an escape, and this line contains fancy Unicode stuff,
-            // it's something we need to pass to a shaper to find out how it
-            // has to be segmented.  Which sadly is Uniscribe at this point :(
-            // Putting something actually good in here would probably be a massive improvement.
-
-            // NOTE(casey): Scan for the next escape code (which Uniscribe helpfully totally fails to handle)
             source_buffer_range SubRange = Range;
             do
             {
@@ -576,14 +886,11 @@ static int ParseLineIntoGlyphs(example_terminal *Terminal, source_buffer_range R
                         (Range.Data[0] != '\x1b'));
 
 
-            // NOTE(casey): Pass the range between the escape codes to Uniscribe
             SubRange.Count = Range.AbsoluteP - SubRange.AbsoluteP;
-            ParseWithUniscribe(Terminal, SubRange, Cursor);
+            ParseWithKB(Terminal, SubRange, Cursor);
         }
         else
         {
-            // NOTE(casey): It's not an escape, and we know there are only simple characters on the line.
-
             wchar_t CodePoint = GetToken(&Range);
             renderer_cell *Cell = GetCell(&Terminal->ScreenBuffer, Cursor->At);
             if(Cell)
@@ -933,7 +1240,6 @@ RefreshFont(example_terminal *Terminal)
         TransferTile(&Terminal->GlyphGen, &Terminal->Renderer, 0, Terminal->ReservedTileTable[TileIndex]);
     }
 
-    // NOTE(casey): Clear the reserved 0 tile
     wchar_t Nothing = 0;
     gpu_glyph_index ZeroTile = {0};
     PrepareTilesForTransfer(&Terminal->GlyphGen, &Terminal->Renderer, 0, &Nothing, UnitDim);
@@ -1187,6 +1493,8 @@ static DWORD WINAPI TerminalThread(LPVOID Param)
     Terminal->FastPipeReady = CreateEventW(0, TRUE, FALSE, 0);
     Terminal->FastPipeTrigger.hEvent = Terminal->FastPipeReady;
     Terminal->PipeSize = 16*1024*1024;
+    
+    ZeroMemory(&Terminal->KBPartitioner, sizeof(kb_partitioner));
 
     ClearCursor(Terminal, &Terminal->RunningCursor);
 
@@ -1221,9 +1529,6 @@ static DWORD WINAPI TerminalThread(LPVOID Param)
     Terminal->GlyphGen = AllocateGlyphGenerator(Terminal->TransferWidth, Terminal->TransferHeight, Terminal->Renderer.GlyphTransferSurface);
     Terminal->ScrollBackBuffer = AllocateSourceBuffer(Terminal->PipeSize);
 
-    ScriptRecordDigitSubstitution(LOCALE_USER_DEFAULT, &Terminal->Partitioner.UniDigiSub); // TODO(casey): Move this out to the stored code
-    ScriptApplyDigitSubstitution(&Terminal->Partitioner.UniDigiSub, &Terminal->Partitioner.UniControl, &Terminal->Partitioner.UniState);
-
     Terminal->MaxLineCount = 8192;
     Terminal->Lines = VirtualAlloc(0, Terminal->MaxLineCount*sizeof(example_line), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
 
@@ -1232,7 +1537,7 @@ static DWORD WINAPI TerminalThread(LPVOID Param)
 
     ShowWindow(Terminal->Window, SW_SHOWDEFAULT);
 
-    AppendOutput(Terminal, "\n"); // TODO(casey): Better line startup - this is here just to initialize the running cursor.
+    AppendOutput(Terminal, "\n");
     AppendOutput(Terminal, "Refterm v%u\n", REFTERM_VERSION);
     AppendOutput(Terminal,
                      "THIS IS \x1b[38;2;255;0;0m\x1b[5mNOT\x1b[0m A REAL \x1b[9mTERMINAL\x1b[0m.\r\n"
@@ -1244,7 +1549,7 @@ static DWORD WINAPI TerminalThread(LPVOID Param)
     AppendOutput(Terminal, OpeningMessage);
     AppendOutput(Terminal, "\n");
     
-    int BlinkMS = 500; // TODO(casey): Use this in blink determination
+    int BlinkMS = 500;
     int MinTermSize = 512;
     uint32_t Width = MinTermSize;
     uint32_t Height = MinTermSize;
@@ -1310,13 +1615,13 @@ static DWORD WINAPI TerminalThread(LPVOID Param)
 
             if(!SlowIn && (Terminal->Legacy_ReadStdOut != INVALID_HANDLE_VALUE))
             {
-                CloseHandle(Terminal->Legacy_ReadStdOut); // TODO(casey): Not sure if this is supposed to be called?
+                CloseHandle(Terminal->Legacy_ReadStdOut);
                 Terminal->Legacy_ReadStdOut = INVALID_HANDLE_VALUE;
             }
 
             if(!ErrIn && (Terminal->Legacy_ReadStdError != INVALID_HANDLE_VALUE))
             {
-                CloseHandle(Terminal->Legacy_ReadStdError); // TODO(casey): Not sure if this is supposed to be called?
+                CloseHandle(Terminal->Legacy_ReadStdError);
                 Terminal->Legacy_ReadStdError = INVALID_HANDLE_VALUE;
             }
         }
